@@ -12,6 +12,28 @@ using Stratis.FederatedPeg.Features.FederationGateway.NetworkHelpers;
 
 namespace Stratis.FederatedPeg.Features.FederationGateway.TargetChain
 {
+    /// <summary>
+    /// Requests partial transactions from the peers and calls <see cref="ICrossChainTransferStore.MergeTransactionSignaturesAsync".
+    /// </summary>
+    public interface IPartialTransactionRequester
+    {
+        /// <summary>
+        /// Broadcast the partial transaction request to federation members.
+        /// </summary>
+        /// <param name="payload">The payload to broadcast.</param>
+        Task BroadcastAsync(RequestPartialTransactionPayload payload);
+
+        /// <summary>
+        /// Starts the broadcasting of partial transaction requests.
+        /// </summary>
+        void Start();
+
+        /// <summary>
+        /// Stops the broadcasting of partial transaction requests.
+        /// </summary>
+        void Stop();
+    }
+
     /// <inheritdoc />
     public class PartialTransactionRequester : IPartialTransactionRequester
     {
@@ -51,8 +73,6 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.TargetChain
         /// <inheritdoc />
         public async Task BroadcastAsync(RequestPartialTransactionPayload payload)
         {
-            this.logger.LogTrace("({0}:'{1}',{2}:'{3}')", nameof(payload.Command), payload.Command, nameof(payload.DepositId), payload.DepositId);
-
             List<INetworkPeer> peers = this.connectionManager.ConnectedPeers.ToList();
 
             var ipAddressComparer = new IPAddressComparer();
@@ -74,8 +94,6 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.TargetChain
                     }
                 }
             }
-
-            this.logger.LogTrace("(-)");
         }
 
         /// <inheritdoc />

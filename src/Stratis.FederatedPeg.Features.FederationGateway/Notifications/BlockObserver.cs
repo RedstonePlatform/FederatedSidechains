@@ -1,10 +1,14 @@
 ﻿using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using NBitcoin;
 using Stratis.Bitcoin.Primitives;
 using Stratis.Bitcoin.Signals;
 using Stratis.Bitcoin.Utilities;
 using Stratis.FederatedPeg.Features.FederationGateway.Interfaces;
 using Stratis.FederatedPeg.Features.FederationGateway.Models;
+using Stratis.FederatedPeg.Features.FederationGateway.RestClients;
+using Stratis.FederatedPeg.Features.FederationGateway.TargetChain;
 
 namespace Stratis.FederatedPeg.Features.FederationGateway.Notifications
 {
@@ -17,9 +21,7 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.Notifications
         // The monitor we pass the new blocks onto.
         private readonly IFederationWalletSyncManager walletSyncManager;
 
-        private readonly IMaturedBlockSender maturedBlockSender;
-
-        private readonly IMaturedBlocksProvider maturedBlocksProvider;
+        private readonly IFederationGatewayClient federationGatewayClient;
 
         private readonly IDepositExtractor depositExtractor;
 
@@ -27,7 +29,9 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.Notifications
 
         private readonly IWithdrawalReceiver withdrawalReceiver;
 
-        private readonly IBlockTipSender blockTipSender;
+        private CancellationTokenSource cancellationSource;
+
+        private Task pushBlockTipTask;
 
         /// <summary>
         /// Initialize the block observer with the wallet manager and the cross chain monitor.
@@ -36,31 +40,27 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.Notifications
         /// <param name="depositExtractor">The component used to extract the deposits from the blocks appearing on chain.</param>
         /// <param name="withdrawalExtractor">The component used to extract withdrawals from blocks.</param>
         /// <param name="withdrawalReceiver">The component that receives the withdrawals extracted from blocks.</param>
-        /// <param name="maturedBlockSender">Service responsible for publishing newly matured blocks.</param>
-        /// <param name="blockTipSender">Service responsible for publishing the block tip.</param>
+        /// <param name="federationGatewayClient">Client for federation gateway api.</param>
         public BlockObserver(IFederationWalletSyncManager walletSyncManager,
                              IDepositExtractor depositExtractor,
                              IWithdrawalExtractor withdrawalExtractor,
                              IWithdrawalReceiver withdrawalReceiver,
-                             IMaturedBlockSender maturedBlockSender,
-                             IMaturedBlocksProvider maturedBlocksProvider,
-                             IBlockTipSender blockTipSender)
+                             IFederationGatewayClient federationGatewayClient)
         {
             Guard.NotNull(walletSyncManager, nameof(walletSyncManager));
-            Guard.NotNull(maturedBlockSender, nameof(maturedBlockSender));
-            Guard.NotNull(maturedBlocksProvider, nameof(maturedBlocksProvider));
-            Guard.NotNull(blockTipSender, nameof(blockTipSender));
+            Guard.NotNull(federationGatewayClient, nameof(federationGatewayClient));
             Guard.NotNull(depositExtractor, nameof(depositExtractor));
             Guard.NotNull(withdrawalExtractor, nameof(withdrawalExtractor));
             Guard.NotNull(withdrawalReceiver, nameof(withdrawalReceiver));
 
             this.walletSyncManager = walletSyncManager;
-            this.maturedBlockSender = maturedBlockSender;
-            this.maturedBlocksProvider = maturedBlocksProvider;
+            this.federationGatewayClient = federationGatewayClient;
             this.depositExtractor = depositExtractor;
             this.withdrawalExtractor = withdrawalExtractor;
             this.withdrawalReceiver = withdrawalReceiver;
-            this.blockTipSender = blockTipSender;
+
+            this.cancellationSource = null;
+            this.pushBlockTipTask = null;
         }
 
         /// <summary>
@@ -71,24 +71,33 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.Notifications
         {
             this.walletSyncManager.ProcessBlock(chainedHeaderBlock.Block);
 
-            this.blockTipSender.SendBlockTipAsync(
-                new BlockTipModel(
-                    chainedHeaderBlock.ChainedHeader.HashBlock,
-                    chainedHeaderBlock.ChainedHeader.Height,
-                    (int)this.depositExtractor.MinimumDepositConfirmations)).ConfigureAwait(false).GetAwaiter().GetResult();
+            // Cancel previous sending to avoid first sending new tip and then sending older tip.
+            if ((this.pushBlockTipTask != null) && !this.pushBlockTipTask.IsCompleted)
+            {
+                this.cancellationSource.Cancel();
+                this.pushBlockTipTask.GetAwaiter().GetResult();
+
+                this.pushBlockTipTask = null;
+                this.cancellationSource = null;
+            }
+
+            var blockTipModel = new BlockTipModel(chainedHeaderBlock.ChainedHeader.HashBlock,chainedHeaderBlock.ChainedHeader.Height, (int)this.depositExtractor.MinimumDepositConfirmations);
+
+            // There is no reason to wait for the message to be sent.
+            // Awaiting REST API call will only slow this callback.
+            // Callbacks never supposed to do any IO calls or web requests.
+            // Instead we start sending the message and if next block was connected faster than the message was sent we
+            // are canceling it and sending the next tip.
+            // Receiver of this message doesn't care if we are not providing tips for every block we connect,
+            // it just requires to know about out latest state.
+            this.cancellationSource = new CancellationTokenSource();
+            this.pushBlockTipTask = Task.Run(async () => await this.federationGatewayClient.PushCurrentBlockTipAsync(blockTipModel, this.cancellationSource.Token).ConfigureAwait(false));
 
             IReadOnlyList<IWithdrawal> withdrawals = this.withdrawalExtractor.ExtractWithdrawalsFromBlock(
                 chainedHeaderBlock.Block,
                 chainedHeaderBlock.ChainedHeader.Height);
 
             this.withdrawalReceiver.ReceiveWithdrawals(withdrawals);
-
-            IMaturedBlockDeposits maturedBlockDeposits =
-                this.maturedBlocksProvider.ExtractMaturedBlockDeposits(chainedHeaderBlock.ChainedHeader);
-
-            if (maturedBlockDeposits == null) return;
-
-            this.maturedBlockSender.SendMaturedBlockDepositsAsync(maturedBlockDeposits).ConfigureAwait(false).GetAwaiter().GetResult();
         }
     }
 }

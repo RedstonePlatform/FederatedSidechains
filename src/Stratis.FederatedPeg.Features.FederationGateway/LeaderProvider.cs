@@ -2,11 +2,21 @@
 using System.Linq;
 using NBitcoin;
 using Stratis.Bitcoin.Utilities;
-using Stratis.FederatedPeg.Features.FederationGateway.Interfaces;
 using Stratis.FederatedPeg.Features.FederationGateway.Models;
 
 namespace Stratis.FederatedPeg.Features.FederationGateway
 {
+    /// <summary>
+    /// This class determines which federated member to select as the next leader based on a change in block height.
+    /// </summary>
+    public interface ILeaderProvider
+    {
+        /// <summary>Public key of the current leader.</summary>
+        PubKey CurrentLeaderKey { get; }
+
+        void Update(BlockTipModel blockTipModel);
+    }
+
     /// <summary>
     /// This class determines which federated member to select as the next leader based on a change in block height.
     /// <para>
@@ -31,16 +41,16 @@ namespace Stratis.FederatedPeg.Features.FederationGateway
                 ToList().
                 AsReadOnly();
 
-            this.CurrentLeader = new PubKey(this.orderedFederationPublicKeys.First());
+            this.CurrentLeaderKey = new PubKey(this.orderedFederationPublicKeys.First());
         }
 
-        public PubKey CurrentLeader { get; private set; }
+        public PubKey CurrentLeaderKey { get; private set; }
 
         public void Update(BlockTipModel blockTipModel)
         {
             Guard.NotNull(blockTipModel, nameof(blockTipModel));
 
-            this.CurrentLeader = new PubKey(this.orderedFederationPublicKeys[blockTipModel.Height % this.orderedFederationPublicKeys.Count]);
+            this.CurrentLeaderKey = new PubKey(this.orderedFederationPublicKeys[blockTipModel.Height % this.orderedFederationPublicKeys.Count]);
         }
     }
 }

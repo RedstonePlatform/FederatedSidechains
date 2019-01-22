@@ -3,6 +3,7 @@ using System.Linq;
 using Microsoft.Extensions.Logging;
 using NBitcoin;
 using Stratis.Bitcoin;
+using Stratis.Bitcoin.Primitives;
 using Stratis.FederatedPeg.Features.FederationGateway.Interfaces;
 using Stratis.FederatedPeg.Features.FederationGateway.Models;
 
@@ -15,8 +16,6 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.SourceChain
         private readonly ILogger logger;
 
         private readonly Script depositScript;
-
-        private readonly ConcurrentChain chain;
 
         public uint MinimumDepositConfirmations { get; private set; }
 
@@ -33,7 +32,6 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.SourceChain
                 federationGatewaySettings?.MultiSigAddress?.ScriptPubKey;
             this.opReturnDataReader = opReturnDataReader;
             this.MinimumDepositConfirmations = federationGatewaySettings.MinimumDepositConfirmations;
-            this.chain = fullNode.NodeService<ConcurrentChain>();
         }
 
         /// <inheritdoc />
@@ -44,7 +42,7 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.SourceChain
 
             foreach (Transaction transaction in block.Transactions)
             {
-                IDeposit deposit = ExtractDepositFromTransaction(transaction, blockHeight, blockHash);
+                IDeposit deposit = this.ExtractDepositFromTransaction(transaction, blockHeight, blockHash);
                 if (deposit != null)
                 {
                     deposits.Add(deposit);
@@ -64,28 +62,29 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.SourceChain
             if (!depositsToMultisig.Any())
                 return null;
 
-            string targetAddress = this.opReturnDataReader.TryGetTargetAddress(transaction);
-            if (string.IsNullOrWhiteSpace(targetAddress))
+            if (!this.opReturnDataReader.TryGetTargetAddress(transaction, out string targetAddress))
                 return null;
 
-            this.logger.LogInformation("Processing received transaction with address: {0}. Transaction hash: {1}.",
+            this.logger.LogInformation("Processing a received deposit transaction with address: {0}. Transaction hash: {1}.",
                 targetAddress, transaction.GetHash());
 
             return new Deposit(transaction.GetHash(), depositsToMultisig.Sum(o => o.Value), targetAddress, blockHeight, blockHash);
         }
 
-        public IMaturedBlockDeposits ExtractBlockDeposits(ChainedHeader newlyMaturedBlock)
+        public MaturedBlockDepositsModel ExtractBlockDeposits(ChainedHeaderBlock newlyMaturedBlock)
         {
-            if (newlyMaturedBlock == null) return null;
+            if (newlyMaturedBlock == null)
+                return null;
 
-            var maturedBlock = new MaturedBlockModel()
+            var maturedBlock = new MaturedBlockInfoModel()
             {
-                BlockHash = newlyMaturedBlock.HashBlock,
-                BlockHeight = newlyMaturedBlock.Height
+                BlockHash = newlyMaturedBlock.ChainedHeader.HashBlock,
+                BlockHeight = newlyMaturedBlock.ChainedHeader.Height,
+                BlockTime = newlyMaturedBlock.ChainedHeader.Header.Time
             };
 
             IReadOnlyList<IDeposit> deposits =
-                this.ExtractDepositsFromBlock(newlyMaturedBlock.Block, newlyMaturedBlock.Height);
+                this.ExtractDepositsFromBlock(newlyMaturedBlock.Block, newlyMaturedBlock.ChainedHeader.Height);
 
             var maturedBlockDeposits = new MaturedBlockDepositsModel(maturedBlock, deposits);
 

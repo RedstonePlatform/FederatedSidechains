@@ -2,7 +2,7 @@ using System;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
 using NSubstitute;
-using Stratis.FederatedPeg.Features.FederationGateway.Interfaces;
+using Stratis.FederatedPeg.Features.FederationGateway;
 using Stratis.FederatedPeg.Features.FederationGateway.TargetChain;
 using Xunit;
 
@@ -37,16 +37,16 @@ namespace Stratis.FederatedPeg.Tests
             this.streamSubscription = this.leaderReceiver.LeaderProvidersStream.Subscribe(
                 _ => { receivedLeaderCount++; });
 
-            this.leaderProvider.CurrentLeader.Returns(new NBitcoin.PubKey(PublicKey));
+            this.leaderProvider.CurrentLeaderKey.Returns(new NBitcoin.PubKey(PublicKey));
 
             for (int i = 0; i < LeaderCount; i++)
-                this.leaderReceiver.ReceiveLeader(this.leaderProvider);
+                this.leaderReceiver.PushLeader(this.leaderProvider);
 
             receivedLeaderCount.Should().Be(LeaderCount);
 
-            string logMsg = string.Format("Received federated leader: {0}", PublicKey);
+            string logMsg = $"Received federated leader: {PublicKey}.";
 
-            this.logger.Received(receivedLeaderCount).Log(LogLevel.Debug,
+            this.logger.Received(receivedLeaderCount).Log(LogLevel.Information,
                 Arg.Any<EventId>(),
                 Arg.Is<object>(o => o.ToString() == logMsg),
                 null,

@@ -7,20 +7,23 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.Extensions.Logging;
 using NBitcoin;
+using Stratis.Bitcoin.Features.PoA;
 using Stratis.Bitcoin.Utilities;
 using Stratis.Bitcoin.Utilities.JsonErrors;
 using Stratis.FederatedPeg.Features.FederationGateway.Interfaces;
 using Stratis.FederatedPeg.Features.FederationGateway.Models;
+using Stratis.FederatedPeg.Features.FederationGateway.SourceChain;
+using Stratis.FederatedPeg.Features.FederationGateway.TargetChain;
 
 namespace Stratis.FederatedPeg.Features.FederationGateway.Controllers
 {
     public static class FederationGatewayRouteEndPoint
     {
-        public const string ReceiveMaturedBlocks = "receive-matured-blocks";
-        public const string ReceiveCurrentBlockTip = "receive-current-block-tip";
+        // TODO do we have push mechanism for the block tip? Remove it. We only need pull mechanism. And I hope we don't have push and pull implemented at the same time
+        public const string PushCurrentBlockTip = "push_current_block_tip";
+
         public const string GetMaturedBlockDeposits = "get_matured_block_deposits";
-        public const string CreateSessionOnCounterChain = "create-session-oncounterchain";
-        public const string ProcessSessionOnCounterChain = "process-session-oncounterchain";
+        public const string GetInfo = "info";
     }
 
     /// <summary>
@@ -32,55 +35,46 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.Controllers
         /// <summary>Instance logger.</summary>
         private readonly ILogger logger;
 
-        private readonly IMaturedBlockReceiver maturedBlockReceiver;
+        private readonly Network network;
 
         private readonly ILeaderProvider leaderProvider;
 
-        private readonly ConcurrentChain chain;
-
         private readonly IMaturedBlocksProvider maturedBlocksProvider;
-
-        private readonly IMaturedBlocksRequester maturedBlocksRequester;
-
-        private readonly IDepositExtractor depositExtractor;
 
         private readonly ILeaderReceiver leaderReceiver;
 
+        private readonly IFederationGatewaySettings federationGatewaySettings;
+
+        private readonly IFederationWalletManager federationWalletManager;
+
+        private readonly FederationManager federationManager;
+
         public FederationGatewayController(
             ILoggerFactory loggerFactory,
-            IMaturedBlockReceiver maturedBlockReceiver,
-            IMaturedBlocksRequester maturedBlocksRequester,
+            Network network,
             ILeaderProvider leaderProvider,
-            ConcurrentChain chain,
             IMaturedBlocksProvider maturedBlocksProvider,
-            IDepositExtractor depositExtractor,
-            ILeaderReceiver leaderReceiver)
+            ILeaderReceiver leaderReceiver,
+            IFederationGatewaySettings federationGatewaySettings,
+            IFederationWalletManager federationWalletManager,
+            FederationManager federationManager = null)
         {
             this.logger = loggerFactory.CreateLogger(this.GetType().FullName);
-            this.maturedBlockReceiver = maturedBlockReceiver;
-            this.maturedBlocksRequester = maturedBlocksRequester;
+            this.network = network;
             this.leaderProvider = leaderProvider;
-            this.chain = chain;
             this.maturedBlocksProvider = maturedBlocksProvider;
-            this.depositExtractor = depositExtractor;
             this.leaderReceiver = leaderReceiver;
+            this.federationGatewaySettings = federationGatewaySettings;
+            this.federationWalletManager = federationWalletManager;
+            this.federationManager = federationManager;
         }
 
-        [Route(FederationGatewayRouteEndPoint.ReceiveMaturedBlocks)]
-        [HttpPost]
-        public void ReceiveMaturedBlock([FromBody] MaturedBlockDepositsModel maturedBlockDeposits)
-        {
-            this.maturedBlockReceiver.ReceiveMaturedBlockDeposits(new[] { maturedBlockDeposits });
-        }
-
-        /// <summary>
-        /// Receives the current block tip to be used for updating the federated leader in a round robin fashion.
-        /// </summary>
+        /// <summary>Pushes the current block tip to be used for updating the federated leader in a round robin fashion.</summary>
         /// <param name="blockTip"><see cref="BlockTipModel"/>Block tip Hash and Height received.</param>
         /// <returns><see cref="IActionResult"/>OK on success.</returns>
-        [Route(FederationGatewayRouteEndPoint.ReceiveCurrentBlockTip)]
+        [Route(FederationGatewayRouteEndPoint.PushCurrentBlockTip)]
         [HttpPost]
-        public IActionResult ReceiveCurrentBlockTip([FromBody] BlockTipModel blockTip)
+        public IActionResult PushCurrentBlockTip([FromBody] BlockTipModel blockTip)
         {
             Guard.NotNull(blockTip, nameof(blockTip));
 
@@ -93,13 +87,13 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.Controllers
             {
                 this.leaderProvider.Update(new BlockTipModel(blockTip.Hash, blockTip.Height, blockTip.MatureConfirmations));
 
-                this.leaderReceiver.ReceiveLeader(this.leaderProvider);
+                this.leaderReceiver.PushLeader(this.leaderProvider);
 
                 return this.Ok();
             }
             catch (Exception e)
             {
-                this.logger.LogError("Exception thrown calling /api/FederationGateway/{0}: {1}.", FederationGatewayRouteEndPoint.ReceiveCurrentBlockTip, e.Message);
+                this.logger.LogError("Exception thrown calling /api/FederationGateway/{0}: {1}.", FederationGatewayRouteEndPoint.PushCurrentBlockTip, e.Message);
                 return ErrorHelpers.BuildErrorResponse(HttpStatusCode.BadRequest, $"Could not select the next federated leader: {e.Message}", e.ToString());
             }
         }
@@ -123,7 +117,7 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.Controllers
 
             try
             {
-                List<IMaturedBlockDeposits> deposits = await this.maturedBlocksProvider.GetMaturedDepositsAsync(
+                List<MaturedBlockDepositsModel> deposits = await this.maturedBlocksProvider.GetMaturedDepositsAsync(
                     blockRequest.BlockHeight, blockRequest.MaxBlocksToSend).ConfigureAwait(false);
 
                 return this.Json(deposits);
@@ -136,14 +130,49 @@ namespace Stratis.FederatedPeg.Features.FederationGateway.Controllers
         }
 
         /// <summary>
+        /// Gets some info on the state of the federation.
+        /// </summary>
+        /// <returns>A <see cref="FederationGatewayInfoModel"/> with information about the federation.</returns>
+        [Route(FederationGatewayRouteEndPoint.GetInfo)]
+        [HttpGet]
+        public IActionResult GetInfo()
+        {
+            try
+            {
+                bool isMainchain = this.federationGatewaySettings.IsMainChain;
+
+                var model = new FederationGatewayInfoModel
+                {
+                    IsActive = this.federationWalletManager.IsFederationActive(),
+                    IsMainChain = isMainchain,
+                    FederationNodeIpEndPoints = this.federationGatewaySettings.FederationNodeIpEndPoints.Select(i => $"{i.Address}:{i.Port}"),
+                    MultisigPublicKey = this.federationGatewaySettings.PublicKey,
+                    FederationMultisigPubKeys = this.federationGatewaySettings.FederationPublicKeys.Select(k => k.ToString()),
+                    MiningPublicKey =  isMainchain ? null : this.federationManager.FederationMemberKey?.PubKey.ToString(),
+                    FederationMiningPubKeys = isMainchain ? null : ((PoAConsensusOptions)this.network.Consensus.Options).FederationPublicKeys.Select(k => k.ToString()),
+                    MultiSigAddress = this.federationGatewaySettings.MultiSigAddress,
+                    MultiSigRedeemScript = this.federationGatewaySettings.MultiSigRedeemScript.ToString(),
+                    MinCoinMaturity = this.federationGatewaySettings.MinCoinMaturity,
+                    MinimumDepositConfirmations = this.federationGatewaySettings.MinimumDepositConfirmations
+                };
+
+                return this.Json(model);
+            }
+            catch (Exception e)
+            {
+                this.logger.LogTrace("Exception thrown calling /api/FederationGateway/{0}: {1}.", FederationGatewayRouteEndPoint.GetInfo, e.Message);
+                return ErrorHelpers.BuildErrorResponse(HttpStatusCode.BadRequest, e.Message, e.ToString());
+            }
+        }
+
+        /// <summary>
         /// Builds an <see cref="IActionResult"/> containing errors contained in the <see cref="ControllerBase.ModelState"/>.
         /// </summary>
         /// <returns>A result containing the errors.</returns>
         private static IActionResult BuildErrorResponse(ModelStateDictionary modelState)
         {
             List<ModelError> errors = modelState.Values.SelectMany(e => e.Errors).ToList();
-            return ErrorHelpers.BuildErrorResponse(
-                HttpStatusCode.BadRequest,
+            return ErrorHelpers.BuildErrorResponse(HttpStatusCode.BadRequest,
                 string.Join(Environment.NewLine, errors.Select(m => m.ErrorMessage)),
                 string.Join(Environment.NewLine, errors.Select(m => m.Exception?.Message)));
         }
